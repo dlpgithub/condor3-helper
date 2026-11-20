@@ -173,6 +173,52 @@ static uint32_t BuildChunk(Buf* out, const C3d* m, int tx, int ty, int lod, TriL
     return tris;
 }
 
+// Adaptive chunks: a chunk whose full-detail answer would exceed SPLIT_BYTES is cut into four (by triangle centroid), again and
+// again up to SPLIT_DEPTH times. Dense photogrammetry (e.g. level-20 exports) otherwise gives 50-150 MB chunks that do not fit the
+// arena; they were dropped and the game showed the 8 m LOD up close. Sparse areas keep their big chunks.
+#define SPLIT_BYTES (20u << 20)
+#define SPLIT_DEPTH 4                   // base grid g_cpt x g_cpt per tile -> at most (g_cpt << 4)^2 chunks (90 m with g_cpt = 4)
+typedef struct { const C3d* m; int tx, ty; uint64_t* totTris; uint64_t* totBytes; uint32_t made, split; } Emit;
+
+static void EmitChunk(Emit* e, TriList* per, float x0, float y0, float size, int depth, int gx, int gy) {
+    const C3d* m = e->m; uint64_t ntris = 0; int ob, l, split; C3hChunkInfo inf; ChunkData cd;
+    for (ob = 0; ob < m->nobj; ob++) ntris += per[ob].n;
+    if (!ntris) return;
+    memset(&inf, 0, sizeof inf); memset(&cd, 0, sizeof cd);
+    inf.min[0] = inf.min[1] = inf.min[2] = 1e30f; inf.max[0] = inf.max[1] = inf.max[2] = -1e30f;
+    split = depth < SPLIT_DEPTH && ntris * 44 > SPLIT_BYTES;                    // estimate: 12 B indices + ~1 vertex (32 B) per triangle
+    if (!split) {
+        inf.tris[0] = BuildChunk(&cd.blob[0], m, e->tx, e->ty, 0, per, inf.min, inf.max);
+        split = depth < SPLIT_DEPTH && cd.blob[0].n > SPLIT_BYTES && ntris > 1;
+        if (split) { free(cd.blob[0].p); cd.blob[0].p = NULL; cd.blob[0].n = 0; }
+    }
+    if (split) {
+        float h = size * 0.5f; TriList* kids = calloc((size_t)4 * (m->nobj ? m->nobj : 1), sizeof(TriList)); uint32_t k; int q;
+        for (ob = 0; ob < m->nobj; ob++) for (k = 0; k < per[ob].n; k++) {
+            uint32_t t = per[ob].t[k]; const float* a = m->v[m->idx[t]].pos; const float* b = m->v[m->idx[t + 1]].pos; const float* c = m->v[m->idx[t + 2]].pos;
+            float x = (a[0] + b[0] + c[0]) / 3.0f, y = (a[1] + b[1] + c[1]) / 3.0f; TriList* tl;
+            q = (x >= x0 + h) * 2 + (y >= y0 + h);
+            tl = &kids[(size_t)q * m->nobj + ob];
+            if (tl->n == tl->cap) { tl->cap = tl->cap ? tl->cap * 2 : 256; tl->t = realloc(tl->t, tl->cap * 4); }
+            tl->t[tl->n++] = t;
+        }
+        e->split++;
+        for (q = 0; q < 4; q++) EmitChunk(e, &kids[(size_t)q * m->nobj], x0 + (q >> 1) * h, y0 + (q & 1) * h, h, depth + 1, gx * 2 + (q >> 1), gy * 2 + (q & 1));
+        for (k = 0; k < (uint32_t)(4 * m->nobj); k++) free(kids[k].t);
+        free(kids);
+        return;
+    }
+    for (l = 1; l < LODS; l++) inf.tris[l] = BuildChunk(&cd.blob[l], m, e->tx, e->ty, l, per, inf.min, inf.max);
+    inf.tile_x = (int16_t)e->tx; inf.tile_y = (int16_t)e->ty;
+    inf.cx = (uint16_t)(gx << (SPLIT_DEPTH - depth)); inf.cy = (uint16_t)(gy << (SPLIT_DEPTH - depth));   // on the finest grid
+    for (l = 0; l < LODS; l++) {
+        inf.bytes[l] = (uint32_t)cd.blob[l].n; e->totTris[l] += inf.tris[l]; e->totBytes[l] += cd.blob[l].n;
+        if (cd.blob[l].n > C3H_ARENA_SIZE) { Log("chunk %d %d %d %d lod %d too large (%zu bytes), dropped", e->tx, e->ty, inf.cx, inf.cy, l, cd.blob[l].n); free(cd.blob[l].p); cd.blob[l].p = NULL; cd.blob[l].n = 0; inf.bytes[l] = 0; }
+    }
+    g_info = realloc(g_info, (g_nchunks + 1) * sizeof *g_info); g_chunks = realloc(g_chunks, (g_nchunks + 1) * sizeof *g_chunks);
+    g_info[g_nchunks] = inf; g_chunks[g_nchunks] = cd; g_nchunks++; e->made++;
+}
+
 static int OpenLandscape(const char* dir, char* msg) {
     char p[MAX_PATH * 2]; Buf trn, oha; uint32_t w, h; float cell; DWORD t0 = GetTickCount();
     uint64_t totTris[LODS] = {0}, totBytes[LODS] = {0};
@@ -191,7 +237,7 @@ static int OpenLandscape(const char* dir, char* msg) {
     oha.p[oha.n] = 0;
     {   char* line = strtok((char*)oha.p, "\r\n");
         for (; line; line = strtok(NULL, "\r\n")) {
-            int key, tx, ty, ci, cj, l, n = g_cpt; char val[64] = ""; C3d m; Buf f; TriList* lists; uint32_t t;
+            int key, tx, ty, ci, cj, n = g_cpt; char val[64] = ""; C3d m; Buf f; TriList* lists; uint32_t t;
             if (sscanf(line, "%d %63s", &key, val) < 2 || !val[0]) continue;
             tx = key / 1000; ty = key % 1000;
             _snprintf(p, sizeof p, "%s\\Autogen\\o%03d%03d.c3d", dir, tx, ty); f = ReadFileAll(p);
@@ -214,24 +260,13 @@ static int OpenLandscape(const char* dir, char* msg) {
                     }
                 }
             }
-            for (ci = 0; ci < n; ci++) for (cj = 0; cj < n; cj++) {
-                TriList* per = &lists[((size_t)ci * n + cj) * m.nobj]; C3hChunkInfo inf; ChunkData cd; int any = 0, ob;
-                for (ob = 0; ob < m.nobj; ob++) any |= per[ob].n != 0;
-                if (!any) continue;
-                memset(&inf, 0, sizeof inf); memset(&cd, 0, sizeof cd);
-                inf.tile_x = (int16_t)tx; inf.tile_y = (int16_t)ty; inf.cx = (uint16_t)ci; inf.cy = (uint16_t)cj;
-                inf.min[0] = inf.min[1] = inf.min[2] = 1e30f; inf.max[0] = inf.max[1] = inf.max[2] = -1e30f;
-                for (l = 0; l < LODS; l++) {
-                    inf.tris[l] = BuildChunk(&cd.blob[l], &m, tx, ty, l, per, inf.min, inf.max);
-                    inf.bytes[l] = (uint32_t)cd.blob[l].n; totTris[l] += inf.tris[l]; totBytes[l] += cd.blob[l].n;
-                    if (cd.blob[l].n > C3H_ARENA_SIZE) { Log("chunk %d %d %d %d lod %d too large (%zu bytes), dropped", tx, ty, ci, cj, l, cd.blob[l].n); free(cd.blob[l].p); cd.blob[l].p = NULL; cd.blob[l].n = 0; inf.bytes[l] = 0; }
-                }
-                g_info = realloc(g_info, (g_nchunks + 1) * sizeof *g_info); g_chunks = realloc(g_chunks, (g_nchunks + 1) * sizeof *g_chunks);
-                g_info[g_nchunks] = inf; g_chunks[g_nchunks] = cd; g_nchunks++;
+            {   Emit e = { &m, tx, ty, totTris, totBytes, 0, 0 }; float cs = g_tile / n;
+                for (ci = 0; ci < n; ci++) for (cj = 0; cj < n; cj++)
+                    EmitChunk(&e, &lists[((size_t)ci * n + cj) * m.nobj], -g_tile * 0.5f + ci * cs, -g_tile * 0.5f + cj * cs, cs, 0, ci, cj);
+                for (t = 0; t < (uint32_t)(n * n * m.nobj); t++) free(lists[t].t);
+                free(lists); free(m.obj); free(f.p);
+                Log("tile %d %d: %u objects, %u vertices, %u triangles -> %u chunks (%u splits)", tx, ty, (unsigned)m.nobj, m.nverts, m.nidx / 3, e.made, e.split);
             }
-            for (t = 0; t < (uint32_t)(n * n * m.nobj); t++) free(lists[t].t);
-            free(lists); free(m.obj); free(f.p);
-            Log("tile %d %d: %u objects, %u vertices, %u triangles", tx, ty, (unsigned)m.nobj, m.nverts, m.nidx / 3);
         }
     }
     free(oha.p);
