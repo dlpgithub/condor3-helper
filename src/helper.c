@@ -313,11 +313,11 @@ static void ProcessTile(TileJob* J) {
     // LODs 1.. of every leaf
     for (i = 0; i < J->nleaf; i++) {
         Leaf* L = &J->leaf[i];
-        L->inf.err[0] = errOf[0];
+        L->inf.err[0] = errOf[0]; L->inf.level[0] = (int8_t)J->level[0];
         for (l = 1; l < LODS; l++) {
             int sidx = srcOf[l]; const TriList* tl = sidx == 0 ? L->lists0 : &setLists[sidx][(size_t)i * src[sidx].nobj];
             L->inf.tris[l] = BuildChunk(&L->cd.blob[l], &src[sidx], J->tx, J->ty, l, tl, cellOf[l], dropOf[l], L->inf.min, L->inf.max);
-            L->inf.err[l] = errOf[l];
+            L->inf.err[l] = errOf[l]; L->inf.level[l] = (int8_t)(cellOf[l] > 0 ? -1 : J->level[l]);
         }
         for (ob = 0; ob < src[0].nobj; ob++) free(L->lists0[ob].t);
         free(L->lists0); L->lists0 = NULL;
