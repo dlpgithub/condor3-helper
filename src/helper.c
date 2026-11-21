@@ -16,12 +16,11 @@
 
 static FILE* g_log;
 static void Log(const char* fmt, ...) {
-    va_list ap; SYSTEMTIME t;
+    va_list ap; SYSTEMTIME t; char line[1024];                       // one fprintf per line: OPEN logs from several threads
     if (!g_log) return;
     GetLocalTime(&t);
-    fprintf(g_log, "%02d:%02d:%02d.%03d ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
-    va_start(ap, fmt); vfprintf(g_log, fmt, ap); va_end(ap);
-    fputc('\n', g_log); fflush(g_log);
+    va_start(ap, fmt); _vsnprintf(line, sizeof line - 1, fmt, ap); va_end(ap); line[sizeof line - 1] = 0;
+    fprintf(g_log, "%02d:%02d:%02d.%03d %s\n", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, line); fflush(g_log);
 }
 
 // ---- small helpers -------------------------------------------------------------------------------------------
@@ -75,10 +74,12 @@ static int ParseC3d(C3d* m, Buf b) {
 }
 
 // ---- landscape state -----------------------------------------------------------------------------------------
-#define LODS 3
-static const float kLodCell[LODS] = { 0.0f, 8.0f, 24.0f };      // vertex clustering cell per LOD (metres)
-static const int   kTexLod[LODS]  = { 0, 1, 3 };                     // mip levels dropped per LOD (2048 -> 1024 -> 256)
-static const float kUvQuant[LODS] = { 0.0f, 16.0f, 6.0f };                 // texture-coordinate grouping per LOD (atlas fraction)
+// Every chunk has LODS levels. The chain per tile is built from the detail sets the compiler wrote (Autogen/lods.txt: the tile's
+// full-detail file first, then coarser sets such as o0201_L19.c3d / o0201_L17.c3d made from the export's own coarser levels), and
+// the remaining levels are vertex clustering of the coarsest set. Without lods.txt (older landscapes): full, 8 m, 24 m, 72 m clustering.
+// Each level carries a geometric error in metres; the mod picks a chunk's level by how large that error looks on screen.
+#define LODS C3H_MAX_LOD
+static const int kTexLod[LODS] = { 0, 1, 3, 5 };                // default mip levels dropped per LOD (2048 -> 1024 -> 256 -> 64)
 
 typedef struct { Buf blob[LODS]; } ChunkData;                    // ready-to-send C3hChunk answers
 static char       g_dir[MAX_PATH];                                // landscape folder
@@ -87,14 +88,24 @@ static float      g_tile = 5760.0f;
 static C3hChunkInfo* g_info; static ChunkData* g_chunks; static uint32_t g_nchunks;
 static char     (*g_tex)[260]; static uint32_t g_ntex;           // texture paths relative to Autogen/
 static Buf*       g_texfile;                                      // loaded on demand
+static uint8_t  (*g_texDrop)[LODS];                               // mip levels to drop per texture and LOD (0xff = kTexLod):
+                                                                  // a detail set's own atlas pages are already coarse -> 0
+static CRITICAL_SECTION g_texLock;                                // TexId is called from the OPEN worker threads
 
-static int TexId(const char* t) {
-    uint32_t i;
+static int TexId(const char* t, int lod, int drop) {
+    uint32_t i; int r = -1;
     if (!t[0]) return -1;
-    for (i = 0; i < g_ntex; i++) if (!_stricmp(g_tex[i], t)) return (int)i;
-    g_tex = realloc(g_tex, (g_ntex + 1) * sizeof *g_tex); strcpy(g_tex[g_ntex], t);
-    g_texfile = realloc(g_texfile, (g_ntex + 1) * sizeof *g_texfile); memset(&g_texfile[g_ntex], 0, sizeof(Buf));
-    return (int)g_ntex++;
+    EnterCriticalSection(&g_texLock);
+    for (i = 0; i < g_ntex; i++) if (!_stricmp(g_tex[i], t)) { r = (int)i; break; }
+    if (r < 0) {
+        g_tex = realloc(g_tex, (g_ntex + 1) * sizeof *g_tex); strcpy(g_tex[g_ntex], t);
+        g_texfile = realloc(g_texfile, (g_ntex + 1) * sizeof *g_texfile); memset(&g_texfile[g_ntex], 0, sizeof(Buf));
+        g_texDrop = realloc(g_texDrop, (g_ntex + 1) * sizeof *g_texDrop); memset(g_texDrop[g_ntex], 0xff, LODS);
+        r = (int)g_ntex++;
+    }
+    g_texDrop[r][lod] = (uint8_t)drop;
+    LeaveCriticalSection(&g_texLock);
+    return r;
 }
 
 // open-addressing map uint64 key -> int32 value (vertex clustering)
@@ -109,14 +120,17 @@ static int32_t* MapSlot(Map* m, uint64_t key, int* isNew) {
 }
 
 // Builds the answer for one chunk at one LOD from triangle lists per object (tri = index of the first index of a triangle).
+// cell 0 = the triangles as they are, else vertex clustering with that cell size (metres).
 typedef struct { uint32_t* t; uint32_t n, cap; } TriList;
-static uint32_t BuildChunk(Buf* out, const C3d* m, int tx, int ty, int lod, TriList* perObj, float bmin[3], float bmax[3]) {
+static void TriAdd(TriList* tl, uint32_t t) { if (tl->n == tl->cap) { tl->cap = tl->cap ? tl->cap * 2 : 256; tl->t = realloc(tl->t, tl->cap * 4); } tl->t[tl->n++] = t; }
+static uint32_t BuildChunk(Buf* out, const C3d* m, int tx, int ty, int lod, const TriList* perObj, float cell, int drop, float bmin[3], float bmax[3]) {
     Out o = {0}; C3hChunk* h; uint32_t nparts = 0, nv = 0, ni = 0, tris = 0; int ob;
     C3hPart* parts; Out verts = {0}, idx = {0};
-    float cell = kLodCell[lod];
+    float uvq = cell > 0 ? 128.0f / cell : 0;                    // texture-coordinate grouping (atlas fraction): 8 m -> 16, 24 m -> 5.3
+    if (uvq > 0 && uvq < 2) uvq = 2;
     parts = calloc(m->nobj ? m->nobj : 1, sizeof(C3hPart));
     for (ob = 0; ob < m->nobj; ob++) {
-        TriList* tl = &perObj[ob]; Map map; uint32_t k, firstV = nv, firstI = ni;
+        const TriList* tl = &perObj[ob]; Map map; uint32_t k, firstV = nv, firstI = ni;
         float* acc = NULL; uint32_t nacc = 0, cap = 0;
         if (!tl->n) continue;
         MapInit(&map, (size_t)tl->n * 3);
@@ -124,11 +138,11 @@ static uint32_t BuildChunk(Buf* out, const C3d* m, int tx, int ty, int lod, TriL
             uint32_t c, out3[3]; int j;
             for (j = 0; j < 3; j++) {
                 uint32_t vi = m->idx[tl->t[k] + j]; const C3hVertex* v = &m->v[vi]; uint64_t key; int isNew; int32_t* s;
-                if (lod == 0) key = vi;
+                if (cell <= 0) key = vi;
                 else {
                     int64_t qx = (int64_t)floorf(v->pos[0] / cell) + 4096, qy = (int64_t)floorf(v->pos[1] / cell) + 4096;
                     int64_t qz = (int64_t)floorf(v->pos[2] / cell) + 1024;
-                    int64_t qu = (int64_t)floorf(v->uv[0] * kUvQuant[lod]) & 255, qv = (int64_t)floorf(v->uv[1] * kUvQuant[lod]) & 255;
+                    int64_t qu = (int64_t)floorf(v->uv[0] * uvq) & 255, qv = (int64_t)floorf(v->uv[1] * uvq) & 255;
                     key = ((uint64_t)(qx & 0x3fff) << 42) | ((uint64_t)(qy & 0x3fff) << 28) | ((uint64_t)(qz & 0xfff) << 16) | ((uint64_t)qu << 8) | (uint64_t)qv;
                 }
                 s = MapSlot(&map, key, &isNew);
@@ -153,14 +167,14 @@ static uint32_t BuildChunk(Buf* out, const C3d* m, int tx, int ty, int lod, TriL
             v.normal[0] = a[3] / l; v.normal[1] = a[4] / l; v.normal[2] = a[5] / l;
             v.uv[0] = a[6] * w; v.uv[1] = a[7] * w;
             OutAdd(&verts, &v, sizeof v);
-            if (lod == 0) { int q; for (q = 0; q < 3; q++) { if (v.pos[q] < bmin[q]) bmin[q] = v.pos[q]; if (v.pos[q] > bmax[q]) bmax[q] = v.pos[q]; } }
+            { int q; for (q = 0; q < 3; q++) { if (v.pos[q] < bmin[q]) bmin[q] = v.pos[q]; if (v.pos[q] > bmax[q]) bmax[q] = v.pos[q]; } }
         }
         nv += nacc;
         free(acc); MapFree(&map);
         if (ni == firstI) { nv = firstV; verts.n = (size_t)firstV * sizeof(C3hVertex); continue; }
         {   C3hPart* p = &parts[nparts++]; const C3dObj* so = &m->obj[ob];
             p->first_vertex = firstV; p->vertex_count = nv - firstV; p->first_index = firstI; p->index_count = ni - firstI;
-            p->texture = TexId(so->tex); memcpy(p->color, so->color, 16); memcpy(p->params, so->params, 12);
+            p->texture = TexId(so->tex, lod, drop); memcpy(p->color, so->color, 16); memcpy(p->params, so->params, 12);
             strncpy(p->name, so->name, 31); }
     }
     if (nparts) {
@@ -176,19 +190,25 @@ static uint32_t BuildChunk(Buf* out, const C3d* m, int tx, int ty, int lod, TriL
 // Adaptive chunks: a chunk whose full-detail answer would exceed SPLIT_BYTES is cut into four (by triangle centroid), again and
 // again up to SPLIT_DEPTH times. Dense photogrammetry (e.g. level-20 exports) otherwise gives 50-150 MB chunks that do not fit the
 // arena; they were dropped and the game showed the 8 m LOD up close. Sparse areas keep their big chunks.
+// The chunk regions come from the full-detail file; the coarser sets are cut along the same regions (by triangle centroid).
 #define SPLIT_BYTES (20u << 20)
 #define SPLIT_DEPTH 4                   // base grid g_cpt x g_cpt per tile -> at most (g_cpt << 4)^2 chunks (90 m with g_cpt = 4)
-typedef struct { const C3d* m; int tx, ty; uint64_t* totTris; uint64_t* totBytes; uint32_t made, split; } Emit;
+typedef struct { C3hChunkInfo inf; ChunkData cd; int gx, gy, span; TriList* lists0; } Leaf;
+typedef struct {
+    int tx, ty, nsrc, level[LODS]; char file[LODS][64];            // input: detail sets, finest first (level 0 = unknown)
+    const C3d* m; Leaf* leaf; uint32_t nleaf, cap, split;          // output
+    uint64_t tris[LODS], bytes[LODS]; uint32_t nobj, nverts, ntris; DWORD ms;
+} TileJob;
 
-static void EmitChunk(Emit* e, TriList* per, float x0, float y0, float size, int depth, int gx, int gy) {
-    const C3d* m = e->m; uint64_t ntris = 0; int ob, l, split; C3hChunkInfo inf; ChunkData cd;
+static void EmitChunk(TileJob* e, TriList* per, float x0, float y0, float size, int depth, int gx, int gy) {
+    const C3d* m = e->m; uint64_t ntris = 0; int ob, split; C3hChunkInfo inf; ChunkData cd;
     for (ob = 0; ob < m->nobj; ob++) ntris += per[ob].n;
     if (!ntris) return;
     memset(&inf, 0, sizeof inf); memset(&cd, 0, sizeof cd);
     inf.min[0] = inf.min[1] = inf.min[2] = 1e30f; inf.max[0] = inf.max[1] = inf.max[2] = -1e30f;
     split = depth < SPLIT_DEPTH && ntris * 44 > SPLIT_BYTES;                    // estimate: 12 B indices + ~1 vertex (32 B) per triangle
     if (!split) {
-        inf.tris[0] = BuildChunk(&cd.blob[0], m, e->tx, e->ty, 0, per, inf.min, inf.max);
+        inf.tris[0] = BuildChunk(&cd.blob[0], m, e->tx, e->ty, 0, per, 0, 0, inf.min, inf.max);
         split = depth < SPLIT_DEPTH && cd.blob[0].n > SPLIT_BYTES && ntris > 1;
         if (split) { free(cd.blob[0].p); cd.blob[0].p = NULL; cd.blob[0].n = 0; }
     }
@@ -196,11 +216,9 @@ static void EmitChunk(Emit* e, TriList* per, float x0, float y0, float size, int
         float h = size * 0.5f; TriList* kids = calloc((size_t)4 * (m->nobj ? m->nobj : 1), sizeof(TriList)); uint32_t k; int q;
         for (ob = 0; ob < m->nobj; ob++) for (k = 0; k < per[ob].n; k++) {
             uint32_t t = per[ob].t[k]; const float* a = m->v[m->idx[t]].pos; const float* b = m->v[m->idx[t + 1]].pos; const float* c = m->v[m->idx[t + 2]].pos;
-            float x = (a[0] + b[0] + c[0]) / 3.0f, y = (a[1] + b[1] + c[1]) / 3.0f; TriList* tl;
+            float x = (a[0] + b[0] + c[0]) / 3.0f, y = (a[1] + b[1] + c[1]) / 3.0f;
             q = (x >= x0 + h) * 2 + (y >= y0 + h);
-            tl = &kids[(size_t)q * m->nobj + ob];
-            if (tl->n == tl->cap) { tl->cap = tl->cap ? tl->cap * 2 : 256; tl->t = realloc(tl->t, tl->cap * 4); }
-            tl->t[tl->n++] = t;
+            TriAdd(&kids[(size_t)q * m->nobj + ob], t);
         }
         e->split++;
         for (q = 0; q < 4; q++) EmitChunk(e, &kids[(size_t)q * m->nobj], x0 + (q >> 1) * h, y0 + (q & 1) * h, h, depth + 1, gx * 2 + (q >> 1), gy * 2 + (q & 1));
@@ -208,71 +226,189 @@ static void EmitChunk(Emit* e, TriList* per, float x0, float y0, float size, int
         free(kids);
         return;
     }
-    for (l = 1; l < LODS; l++) inf.tris[l] = BuildChunk(&cd.blob[l], m, e->tx, e->ty, l, per, inf.min, inf.max);
-    inf.tile_x = (int16_t)e->tx; inf.tile_y = (int16_t)e->ty;
-    inf.cx = (uint16_t)(gx << (SPLIT_DEPTH - depth)); inf.cy = (uint16_t)(gy << (SPLIT_DEPTH - depth));   // on the finest grid
+    if (e->nleaf == e->cap) { e->cap = e->cap ? e->cap * 2 : 32; e->leaf = realloc(e->leaf, e->cap * sizeof *e->leaf); }
+    {   Leaf* L = &e->leaf[e->nleaf++];
+        L->inf = inf; L->cd = cd; L->span = 1 << (SPLIT_DEPTH - depth);
+        L->gx = gx << (SPLIT_DEPTH - depth); L->gy = gy << (SPLIT_DEPTH - depth);   // on the finest grid
+        L->lists0 = calloc(m->nobj ? m->nobj : 1, sizeof(TriList));
+        for (ob = 0; ob < m->nobj; ob++) if (per[ob].n) {
+            L->lists0[ob].t = malloc((size_t)per[ob].n * 4); memcpy(L->lists0[ob].t, per[ob].t, (size_t)per[ob].n * 4);
+            L->lists0[ob].n = L->lists0[ob].cap = per[ob].n;
+        } }
+}
+
+// geometric error (metres) of a source level: ~1/64 of the 3D-tile edge at that level (L20 0.6 m, L19 1.2 m, L17 4.8 m)
+static float LevelError(int level) { return level > 0 ? (float)(40075016.7 / (double)(1u << (level > 30 ? 30 : level)) / 64.0) : 0.5f; }
+
+static int LoadC3d(C3d* m, const char* file) {
+    char p[MAX_PATH * 2]; Buf f;
+    _snprintf(p, sizeof p, "%s\\Autogen\\%s", g_dir, file); f = ReadFileAll(p);
+    if (!f.p || !ParseC3d(m, f)) { free(f.p); memset(m, 0, sizeof *m); return 0; }
+    return 1;
+}
+
+static void ProcessTile(TileJob* J) {
+    C3d src[LODS]; int s, l, ob, ci, cj, n = g_cpt, G = (int)g_cpt << SPLIT_DEPTH; uint32_t t, i;
+    int srcOf[LODS], dropOf[LODS]; float cellOf[LODS], errOf[LODS]; TriList* lists; TriList* setLists[LODS] = {0}; int32_t* owner; DWORD t0 = GetTickCount();
+    memset(src, 0, sizeof src);
+    if (!LoadC3d(&src[0], J->file[0])) { Log("tile %d %d: cannot read/parse %s", J->tx, J->ty, J->file[0]); return; }
+    for (s = 1; s < J->nsrc; s++) if (!LoadC3d(&src[s], J->file[s])) { Log("tile %d %d: cannot read %s, set ignored", J->tx, J->ty, J->file[s]); J->nsrc = s; break; }
+    // the LOD chain: the sets, then clustering of the coarsest set (cell 8 m or 4x the set's error, then x3 per level)
     for (l = 0; l < LODS; l++) {
-        inf.bytes[l] = (uint32_t)cd.blob[l].n; e->totTris[l] += inf.tris[l]; e->totBytes[l] += cd.blob[l].n;
-        if (cd.blob[l].n > C3H_ARENA_SIZE) { Log("chunk %d %d %d %d lod %d too large (%zu bytes), dropped", e->tx, e->ty, inf.cx, inf.cy, l, cd.blob[l].n); free(cd.blob[l].p); cd.blob[l].p = NULL; cd.blob[l].n = 0; inf.bytes[l] = 0; }
+        if (l < J->nsrc) { srcOf[l] = l; cellOf[l] = 0; errOf[l] = LevelError(J->level[l]); dropOf[l] = 0; }
+        else {
+            srcOf[l] = J->nsrc - 1; dropOf[l] = 2 * (l - J->nsrc) + 1;           // 1, 3, 5 below the coarsest set
+            cellOf[l] = cellOf[l - 1] > 0 ? cellOf[l - 1] * 3.0f : (4.0f * errOf[l - 1] > 8.0f ? 4.0f * errOf[l - 1] : 8.0f);
+            errOf[l] = cellOf[l] * 0.5f;
+        }
     }
-    g_info = realloc(g_info, (g_nchunks + 1) * sizeof *g_info); g_chunks = realloc(g_chunks, (g_nchunks + 1) * sizeof *g_chunks);
-    g_info[g_nchunks] = inf; g_chunks[g_nchunks] = cd; g_nchunks++; e->made++;
+    // full detail: triangle lists per base chunk and object (by centroid), adaptive split -> leaves with LOD 0
+    J->m = &src[0];
+    lists = calloc((size_t)n * n * (src[0].nobj ? src[0].nobj : 1), sizeof(TriList));
+    for (ob = 0; ob < src[0].nobj; ob++) {
+        const C3dObj* so = &src[0].obj[ob]; const C3d* m = &src[0];
+        for (t = so->fi; t + 2 < so->fi + so->ni; t += 3) {
+            const float* a; const float* b; const float* c; float x, y;
+            if (m->idx[t] >= m->nverts || m->idx[t + 1] >= m->nverts || m->idx[t + 2] >= m->nverts) continue;
+            a = m->v[m->idx[t]].pos; b = m->v[m->idx[t + 1]].pos; c = m->v[m->idx[t + 2]].pos;
+            x = (a[0] + b[0] + c[0]) / 3.0f; y = (a[1] + b[1] + c[1]) / 3.0f;
+            ci = (int)floorf((x + g_tile * 0.5f) / (g_tile / n)); cj = (int)floorf((y + g_tile * 0.5f) / (g_tile / n));
+            if (ci < 0) ci = 0; if (ci >= n) ci = n - 1; if (cj < 0) cj = 0; if (cj >= n) cj = n - 1;
+            TriAdd(&lists[((size_t)ci * n + cj) * src[0].nobj + ob], t);
+        }
+    }
+    {   float cs = g_tile / n;
+        for (ci = 0; ci < n; ci++) for (cj = 0; cj < n; cj++)
+            EmitChunk(J, &lists[((size_t)ci * n + cj) * src[0].nobj], -g_tile * 0.5f + ci * cs, -g_tile * 0.5f + cj * cs, cs, 0, ci, cj);
+        for (t = 0; t < (uint32_t)(n * n * src[0].nobj); t++) free(lists[t].t);
+        free(lists); }
+    // which leaf owns each cell of the finest grid (cells without full detail: the nearest leaf, so coarse triangles there are kept)
+    owner = malloc((size_t)G * G * 4);
+    for (i = 0; i < (uint32_t)(G * G); i++) owner[i] = -1;
+    for (i = 0; i < J->nleaf; i++) { const Leaf* L = &J->leaf[i]; int x, y; for (x = 0; x < L->span; x++) for (y = 0; y < L->span; y++) owner[(L->gx + x) * G + L->gy + y] = (int32_t)i; }
+    for (ci = 0; ci < G && J->nleaf; ci++) for (cj = 0; cj < G; cj++) if (owner[ci * G + cj] < 0) {
+        float bd = 1e30f; int32_t bi = 0;
+        for (i = 0; i < J->nleaf; i++) { const Leaf* L = &J->leaf[i]; float dx = L->gx + L->span * 0.5f - (ci + 0.5f), dy = L->gy + L->span * 0.5f - (cj + 0.5f), d = dx * dx + dy * dy; if (d < bd) { bd = d; bi = (int32_t)i; } }
+        owner[ci * G + cj] = -2 - bi;
+    }
+    // coarser sets: triangle lists per leaf and object
+    for (s = 1; s < J->nsrc; s++) {
+        const C3d* m = &src[s];
+        setLists[s] = calloc((size_t)(J->nleaf ? J->nleaf : 1) * (m->nobj ? m->nobj : 1), sizeof(TriList));
+        for (ob = 0; ob < m->nobj && J->nleaf; ob++) {
+            const C3dObj* so = &m->obj[ob];
+            for (t = so->fi; t + 2 < so->fi + so->ni; t += 3) {
+                const float* a; const float* b; const float* c; float x, y; int32_t o;
+                if (m->idx[t] >= m->nverts || m->idx[t + 1] >= m->nverts || m->idx[t + 2] >= m->nverts) continue;
+                a = m->v[m->idx[t]].pos; b = m->v[m->idx[t + 1]].pos; c = m->v[m->idx[t + 2]].pos;
+                x = (a[0] + b[0] + c[0]) / 3.0f; y = (a[1] + b[1] + c[1]) / 3.0f;
+                ci = (int)floorf((x + g_tile * 0.5f) / (g_tile / G)); cj = (int)floorf((y + g_tile * 0.5f) / (g_tile / G));
+                if (ci < 0) ci = 0; if (ci >= G) ci = G - 1; if (cj < 0) cj = 0; if (cj >= G) cj = G - 1;
+                o = owner[ci * G + cj]; if (o < 0) o = -2 - o;
+                TriAdd(&setLists[s][(size_t)o * m->nobj + ob], t);
+            }
+        }
+    }
+    free(owner);
+    // LODs 1.. of every leaf
+    for (i = 0; i < J->nleaf; i++) {
+        Leaf* L = &J->leaf[i];
+        L->inf.err[0] = errOf[0];
+        for (l = 1; l < LODS; l++) {
+            int sidx = srcOf[l]; const TriList* tl = sidx == 0 ? L->lists0 : &setLists[sidx][(size_t)i * src[sidx].nobj];
+            L->inf.tris[l] = BuildChunk(&L->cd.blob[l], &src[sidx], J->tx, J->ty, l, tl, cellOf[l], dropOf[l], L->inf.min, L->inf.max);
+            L->inf.err[l] = errOf[l];
+        }
+        for (ob = 0; ob < src[0].nobj; ob++) free(L->lists0[ob].t);
+        free(L->lists0); L->lists0 = NULL;
+        L->inf.tile_x = (int16_t)J->tx; L->inf.tile_y = (int16_t)J->ty; L->inf.cx = (uint16_t)L->gx; L->inf.cy = (uint16_t)L->gy;
+        for (l = 0; l < LODS; l++) {
+            L->inf.bytes[l] = (uint32_t)L->cd.blob[l].n; J->tris[l] += L->inf.tris[l]; J->bytes[l] += L->cd.blob[l].n;
+            if (L->cd.blob[l].n > C3H_ARENA_SIZE) { Log("chunk %d %d %d %d lod %d too large (%zu bytes), dropped", J->tx, J->ty, L->gx, L->gy, l, L->cd.blob[l].n); free(L->cd.blob[l].p); L->cd.blob[l].p = NULL; L->cd.blob[l].n = 0; L->inf.bytes[l] = 0; }
+        }
+    }
+    for (s = 1; s < J->nsrc; s++) { size_t k; for (k = 0; k < (size_t)(J->nleaf ? J->nleaf : 1) * (src[s].nobj ? src[s].nobj : 1); k++) free(setLists[s][k].t); free(setLists[s]); }
+    J->nobj = (uint32_t)src[0].nobj; J->nverts = src[0].nverts; J->ntris = src[0].nidx / 3; J->ms = GetTickCount() - t0;
+    for (s = 0; s < J->nsrc; s++) { free(src[s].obj); free(src[s].file.p); }
+    {   char ch[160]; int k = 0;
+        for (l = 0; l < LODS; l++) k += cellOf[l] > 0 ? _snprintf(ch + k, sizeof ch - k, "%s%.0f m clusters", l ? ", " : "", cellOf[l])
+                                                       : _snprintf(ch + k, sizeof ch - k, "%sL%d", l ? ", " : "", J->level[l]);
+        Log("tile %d %d: %u objects, %u vertices, %u triangles -> %u chunks (%u splits); LODs %s; %lu ms",
+            J->tx, J->ty, J->nobj, J->nverts, J->ntris, J->nleaf, J->split, ch, (unsigned long)J->ms); }
+}
+
+static TileJob* g_jobs; static int g_njobs; static volatile LONG g_nextJob;
+static DWORD WINAPI TileWorker(LPVOID unused) {
+    (void)unused;
+    for (;;) { LONG k = InterlockedIncrement(&g_nextJob) - 1; if (k >= g_njobs) return 0; ProcessTile(&g_jobs[k]); }
 }
 
 static int OpenLandscape(const char* dir, char* msg) {
-    char p[MAX_PATH * 2]; Buf trn, oha; uint32_t w, h; float cell; DWORD t0 = GetTickCount();
+    char p[MAX_PATH * 2]; Buf trn, oha, lods; uint32_t w, h; float cell; DWORD t0 = GetTickCount(); int k, nthr, hasSets = 0;
     uint64_t totTris[LODS] = {0}, totBytes[LODS] = {0};
     strncpy(g_dir, dir, sizeof g_dir - 1);
     // a new OPEN replaces everything
     { uint32_t i, l; for (i = 0; i < g_nchunks; i++) for (l = 0; l < LODS; l++) free(g_chunks[i].blob[l].p);
       for (i = 0; i < g_ntex; i++) free(g_texfile[i].p);
-      free(g_chunks); free(g_info); free(g_tex); free(g_texfile); g_chunks = NULL; g_info = NULL; g_tex = NULL; g_texfile = NULL; g_nchunks = g_ntex = 0; }
+      free(g_chunks); free(g_info); free(g_tex); free(g_texfile); free(g_texDrop); g_chunks = NULL; g_info = NULL; g_tex = NULL; g_texfile = NULL; g_texDrop = NULL; g_nchunks = g_ntex = 0; }
     { const char* nm = strrchr(dir, '\\'); nm = nm ? nm + 1 : dir;
       _snprintf(p, sizeof p, "%s\\%s.trn", dir, nm); trn = ReadFileAll(p);
       if (trn.n < 12) { sprintf(msg, "cannot read %s", p); return -1; }
       memcpy(&w, trn.p, 4); memcpy(&h, trn.p + 4, 4); memcpy(&cell, trn.p + 8, 4); free(trn.p);
       g_tx = w / 64; g_ty = h / 64; g_tile = 64.0f * cell;
-      _snprintf(p, sizeof p, "%s\\%s.oha", dir, nm); oha = ReadFileAll(p); }
-    if (!oha.p) { sprintf(msg, "no .oha: no autogen"); g_nchunks = 0; return 0; }
+      _snprintf(p, sizeof p, "%s\\%s.oha", dir, nm); oha = ReadFileAll(p);
+      _snprintf(p, sizeof p, "%s\\Autogen\\lods.txt", dir); lods = ReadFileAll(p); }
+    if (!oha.p) { free(lods.p); sprintf(msg, "no .oha: no autogen"); g_nchunks = 0; return 0; }
     oha.p[oha.n] = 0;
+    free(g_jobs); g_jobs = NULL; g_njobs = 0;
     {   char* line = strtok((char*)oha.p, "\r\n");
         for (; line; line = strtok(NULL, "\r\n")) {
-            int key, tx, ty, ci, cj, n = g_cpt; char val[64] = ""; C3d m; Buf f; TriList* lists; uint32_t t;
+            int key, tx, ty; char val[64] = ""; TileJob* J;
             if (sscanf(line, "%d %63s", &key, val) < 2 || !val[0]) continue;
             tx = key / 1000; ty = key % 1000;
-            _snprintf(p, sizeof p, "%s\\Autogen\\o%03d%03d.c3d", dir, tx, ty); f = ReadFileAll(p);
-            if (!f.p) { _snprintf(p, sizeof p, "%s\\Autogen\\o%02d%02d.c3d", dir, tx, ty); f = ReadFileAll(p); }
-            if (!f.p || !ParseC3d(&m, f)) { Log("tile %d %d: cannot read/parse %s", tx, ty, p); free(f.p); continue; }
-            // triangle lists per chunk and object (by centroid)
-            lists = calloc((size_t)n * n * (m.nobj ? m.nobj : 1), sizeof(TriList));
-            {   int ob;
-                for (ob = 0; ob < m.nobj; ob++) {
-                    const C3dObj* so = &m.obj[ob];
-                    for (t = so->fi; t + 2 < so->fi + so->ni; t += 3) {
-                        const float* a = m.v[m.idx[t]].pos; const float* b = m.v[m.idx[t + 1]].pos; const float* c = m.v[m.idx[t + 2]].pos;
-                        float x = (a[0] + b[0] + c[0]) / 3.0f, y = (a[1] + b[1] + c[1]) / 3.0f; TriList* tl;
-                        ci = (int)floorf((x + g_tile * 0.5f) / (g_tile / n)); cj = (int)floorf((y + g_tile * 0.5f) / (g_tile / n));
-                        if (ci < 0) ci = 0; if (ci >= n) ci = n - 1; if (cj < 0) cj = 0; if (cj >= n) cj = n - 1;
-                        if (m.idx[t] >= m.nverts || m.idx[t + 1] >= m.nverts || m.idx[t + 2] >= m.nverts) continue;
-                        tl = &lists[((size_t)ci * n + cj) * m.nobj + ob];
-                        if (tl->n == tl->cap) { tl->cap = tl->cap ? tl->cap * 2 : 256; tl->t = realloc(tl->t, tl->cap * 4); }
-                        tl->t[tl->n++] = t;
-                    }
-                }
-            }
-            {   Emit e = { &m, tx, ty, totTris, totBytes, 0, 0 }; float cs = g_tile / n;
-                for (ci = 0; ci < n; ci++) for (cj = 0; cj < n; cj++)
-                    EmitChunk(&e, &lists[((size_t)ci * n + cj) * m.nobj], -g_tile * 0.5f + ci * cs, -g_tile * 0.5f + cj * cs, cs, 0, ci, cj);
-                for (t = 0; t < (uint32_t)(n * n * m.nobj); t++) free(lists[t].t);
-                free(lists); free(m.obj); free(f.p);
-                Log("tile %d %d: %u objects, %u vertices, %u triangles -> %u chunks (%u splits)", tx, ty, (unsigned)m.nobj, m.nverts, m.nidx / 3, e.made, e.split);
-            }
+            g_jobs = realloc(g_jobs, (g_njobs + 1) * sizeof *g_jobs); J = &g_jobs[g_njobs++]; memset(J, 0, sizeof *J);
+            J->tx = tx; J->ty = ty; J->nsrc = 1;
+            _snprintf(p, sizeof p, "%s\\Autogen\\o%03d%03d.c3d", dir, tx, ty);
+            if (GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES) _snprintf(J->file[0], 64, "o%03d%03d.c3d", tx, ty);
+            else _snprintf(J->file[0], 64, "o%02d%02d.c3d", tx, ty);
         }
     }
     free(oha.p);
-    sprintf(msg, "%u chunks, %u textures; triangles lod0 %llu lod1 %llu lod2 %llu; MB %llu / %llu / %llu; %lu ms", g_nchunks, g_ntex,
-            (unsigned long long)totTris[0], (unsigned long long)totTris[1], (unsigned long long)totTris[2],
-            (unsigned long long)(totBytes[0] >> 20), (unsigned long long)(totBytes[1] >> 20), (unsigned long long)(totBytes[2] >> 20),
+    if (lods.p) {   // "XXYY level file" (or XXXYYY), finest first per tile; the first entry replaces the default full-detail file
+        char* line; lods.p[lods.n] = 0;
+        for (line = strtok((char*)lods.p, "\r\n"); line; line = strtok(NULL, "\r\n")) {
+            char tile[16], file[64]; int lev, tx, ty, j; size_t tl;
+            if (line[0] == '#' || sscanf(line, "%15s %d %63s", tile, &lev, file) != 3) continue;
+            tl = strlen(tile);
+            if (tl == 4) { tx = (tile[0] - '0') * 10 + tile[1] - '0'; ty = atoi(tile + 2); }
+            else if (tl == 6) { tx = (tile[0] - '0') * 100 + (tile[1] - '0') * 10 + tile[2] - '0'; ty = atoi(tile + 3); }
+            else continue;
+            for (j = 0; j < g_njobs; j++) if (g_jobs[j].tx == tx && g_jobs[j].ty == ty) {
+                TileJob* J = &g_jobs[j];
+                if (!_stricmp(file, J->file[0])) { J->level[0] = lev; break; }
+                if (J->nsrc < LODS) { strncpy(J->file[J->nsrc], file, 63); J->level[J->nsrc] = lev; J->nsrc++; hasSets++; }
+                break;
+            }
+        }
+        free(lods.p);
+    }
+    {   SYSTEM_INFO si; HANDLE th[8]; GetSystemInfo(&si);
+        nthr = (int)si.dwNumberOfProcessors; if (nthr > 4) nthr = 4; if (nthr > g_njobs) nthr = g_njobs; if (nthr < 1) nthr = 1;
+        g_nextJob = 0;
+        for (k = 0; k < nthr; k++) th[k] = CreateThread(NULL, 0, TileWorker, NULL, 0, NULL);
+        WaitForMultipleObjects((DWORD)nthr, th, TRUE, INFINITE);
+        for (k = 0; k < nthr; k++) CloseHandle(th[k]); }
+    for (k = 0; k < g_njobs; k++) {   // results in tile order
+        TileJob* J = &g_jobs[k]; uint32_t i; int l;
+        g_info = realloc(g_info, (g_nchunks + J->nleaf + 1) * sizeof *g_info); g_chunks = realloc(g_chunks, (g_nchunks + J->nleaf + 1) * sizeof *g_chunks);
+        for (i = 0; i < J->nleaf; i++) { g_info[g_nchunks] = J->leaf[i].inf; g_chunks[g_nchunks] = J->leaf[i].cd; g_nchunks++; }
+        for (l = 0; l < LODS; l++) { totTris[l] += J->tris[l]; totBytes[l] += J->bytes[l]; }
+        free(J->leaf);
+    }
+    sprintf(msg, "%u chunks, %u textures, %d detail sets, %d threads; triangles %llu / %llu / %llu / %llu; MB %llu / %llu / %llu / %llu; %lu ms",
+            g_nchunks, g_ntex, hasSets, nthr,
+            (unsigned long long)totTris[0], (unsigned long long)totTris[1], (unsigned long long)totTris[2], (unsigned long long)totTris[3],
+            (unsigned long long)(totBytes[0] >> 20), (unsigned long long)(totBytes[1] >> 20), (unsigned long long)(totBytes[2] >> 20), (unsigned long long)(totBytes[3] >> 20),
             (unsigned long)(GetTickCount() - t0));
     return 0;
 }
@@ -316,6 +452,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--log")) strncpy(logp, argv[++i], sizeof logp - 1);
     }
     if (logp[0]) g_log = fopen(logp, "w");
+    InitializeCriticalSection(&g_texLock);
     Log("c3helper %s, 64-bit=%d, pid arg %lu", __DATE__, (int)(sizeof(void*) == 8), (unsigned long)pid);
     if (!pid) { Log("no --pid"); return 2; }
     _snprintf(name, sizeof name, "Local\\c3h_%lu_shm", (unsigned long)pid);  map = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, name);
@@ -345,7 +482,7 @@ int main(int argc, char** argv) {
                 C3hLandscape L; size_t need = sizeof L + (size_t)g_nchunks * sizeof(C3hChunkInfo);
                 memset(&L, 0, sizeof L);
                 L.tiles_x = g_tx; L.tiles_y = g_ty; L.tile_size = g_tile; L.chunks_per_tile = g_cpt; L.n_chunks = g_nchunks; L.n_textures = g_ntex;
-                L.n_lods = LODS; memcpy(L.lod_cell, kLodCell, sizeof kLodCell);
+                L.n_lods = LODS; L.lod_cell[0] = 0; L.lod_cell[1] = 8; L.lod_cell[2] = 24; L.lod_cell[3] = 72;   // typical (per tile it varies)
                 if (need > hd->arena_size) { hd->status = -1; sprintf(hd->resp_msg, "chunk table too large"); }
                 else { memcpy(arena, &L, sizeof L); memcpy(arena + sizeof L, g_info, (size_t)g_nchunks * sizeof(C3hChunkInfo)); hd->resp_size = (uint32_t)need; }
             }
@@ -360,7 +497,8 @@ int main(int argc, char** argv) {
         case C3H_REQ_TEXTURE: {
             int l = hd->req_arg[1]; size_t n;
             if (l < 0) l = 0; if (l >= LODS) l = LODS - 1;
-            n = MakeTexture(arena, hd->arena_size, hd->req_arg[0], kTexLod[l], hd->resp_msg);
+            {   int id = hd->req_arg[0], drop = (id >= 0 && (uint32_t)id < g_ntex && g_texDrop[id][l] != 0xff) ? g_texDrop[id][l] : kTexLod[l];
+                n = MakeTexture(arena, hd->arena_size, id, drop, hd->resp_msg); }
             if (!n) { hd->status = -1; Log("TEXTURE %d: %s", hd->req_arg[0], hd->resp_msg); }
             hd->resp_size = (uint32_t)n;
             break; }

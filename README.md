@@ -8,10 +8,14 @@ each mesh twice (CPU copy + GPU buffer). Measured with `OrlyDemo` (12 autogen ti
 This project moves the heavy data out of the game:
 
 - `c3helper.exe` (this repo, **64-bit** Windows program) loads a landscape's complete autogen (`Autogen/oXXYY.c3d` + textures),
-  cuts every tile into 4 x 4 chunks and builds 3 levels of detail (full; vertex clustering at 8 m; at 24 m), all in 64-bit memory.
+  cuts every tile into 4 x 4 chunks (dense ones split further, max 20 MB each) and builds 4 levels of detail, all in 64-bit memory
+  (4 tiles in parallel). The levels come from the detail sets of `Autogen/lods.txt` when the landscape has them (tiles2condor_v2 writes
+  them from the export's own coarser levels, e.g. L20 / L19 / L17), the remaining ones are vertex clustering (8 m, 24 m, 72 m for
+  landscapes without sets). Each level carries its geometric error in metres.
 - the mod (`d3dx.dll` of `condor3-mod`, module `src/agstream.c`) switches the game's own autogen loading off, asks the helper for
-  the chunks around the glider (full detail up to 2 km, LOD 1 to 5 km, LOD 2 to 12 km), and turns each answer into a real game model
-  that the game draws with its own shaders. Far chunks use textures with fewer mip levels. Chunks that move out of range are freed.
+  the chunks in view range and picks each chunk's level by its screen-space error: the coarsest level whose error looks smaller than
+  2 pixels from the camera (3D distance, altitude counts). It turns each answer into a real game model that the game draws with its
+  own shaders. Far chunks use textures with fewer mip levels. Chunks that move out of range are freed.
 - the two talk through shared memory in the same CrossOver bottle / Windows session (`include/c3h_proto.h`).
 
 Result with `OrlyDemo`: **~0.9 GB instead of 2.3 GB** in flight, same look (see docs/RESULTS.md).
@@ -29,11 +33,15 @@ Optional `<Condor>\postfx\agstream.txt` (one `key value` per line):
 | key | default | meaning |
 |---|---|---|
 | `enable` | 1 | 0 = let the game load autogen itself |
-| `r0`, `r1`, `r2` | 2000, 5000, 12000 | distance (m, glider to chunk box) up to which LOD 0 / 1 / 2 is used; beyond: no autogen |
-| `jobs` | 1 | chunks turned into game models per frame |
+| `tol` | 2 | screen-space error tolerance in pixels: smaller = finer levels farther out (more memory and streaming) |
+| `range` | 15000 | no autogen beyond this distance (m, camera to chunk box) |
+| `budget` | 3 | main-thread streaming work per frame in ms (textures, 4 MB buffer pieces; at least one step per frame) |
+| `lodmode` | 1 | 0 = the old fixed ranges `r0`, `r1`, `r2` (2000, 5000, 12000 m, glider to chunk box, 2D) |
 
 Logs: `<Condor>\postfx\agstream.log` (mod side), `<Condor>\postfx\c3helper.log` (helper). Remote command `ag` (mod's `postfx\cmd.txt`)
-prints the streaming state, `vm` the 32-bit address-space use.
+prints the streaming state and the frame-time statistics, `vm` the 32-bit address-space use (the automatic `vm` every 10 s is off;
+`vm auto on` switches it on). Frames over 30 ms are logged in agstream.log with what streaming did in the tick before
+(`slow frame ...`), so stutters can be told apart from the game's own.
 
 ## Test without the game
     wine c3htest.exe 'Y:\Condor3\c3helper.exe' 'Y:\Condor3\Landscapes\OrlyDemo'
