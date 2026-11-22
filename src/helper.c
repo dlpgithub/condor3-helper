@@ -507,6 +507,137 @@ static int PngToDds(Buf* f) {
     return 1;
 }
 
+// ---- mip levels for textures that have none ---------------------------------------------------------------------
+// About half of the native autogen textures (Slovenia3: 81 of 146 DDS files) are a single level. The game's loader builds the
+// mip chain when it loads them; without it distant buildings shimmer and look pixelated. So, once per texture: level 0 decoded,
+// 2x2 box filter per level (colour weighted by alpha, so cut-out edges do not turn black), each level encoded again in the
+// file's format (simple range fit; BC1 keeps 1-bit alpha). Level 0 stays byte for byte. BC textures get their size rounded up
+// to a multiple of 4 (the blocks already cover it; native D3D11 needs it), so every level's block layout is consistent.
+typedef struct { uint8_t r, g, b, a; } Px;
+static void Rgb565(uint16_t c, Px* p) { p->r = (uint8_t)(((c >> 11) & 31) * 255 / 31); p->g = (uint8_t)(((c >> 5) & 63) * 255 / 63); p->b = (uint8_t)((c & 31) * 255 / 31); p->a = 255; }
+static uint16_t To565(float r, float g, float b) {
+    int R = (int)(r * 31 / 255 + 0.5f), G = (int)(g * 63 / 255 + 0.5f), B = (int)(b * 31 / 255 + 0.5f);
+    R = R < 0 ? 0 : R > 31 ? 31 : R; G = G < 0 ? 0 : G > 63 ? 63 : G; B = B < 0 ? 0 : B > 31 ? 31 : B;
+    return (uint16_t)(R << 11 | G << 5 | B);
+}
+static void ColorPalette(uint16_t c0, uint16_t c1, int four, Px pal[4]) {
+    int k; Rgb565(c0, &pal[0]); Rgb565(c1, &pal[1]);
+    if (four) for (k = 0; k < 3; k++) { (&pal[2].r)[k] = (uint8_t)((2 * (&pal[0].r)[k] + (&pal[1].r)[k] + 1) / 3); (&pal[3].r)[k] = (uint8_t)(((&pal[0].r)[k] + 2 * (&pal[1].r)[k] + 1) / 3); }
+    else { for (k = 0; k < 3; k++) (&pal[2].r)[k] = (uint8_t)(((&pal[0].r)[k] + (&pal[1].r)[k]) / 2); pal[3].r = pal[3].g = pal[3].b = 0; }
+    pal[2].a = 255; pal[3].a = four ? 255 : 0;
+}
+static void DecodeBlock(const uint8_t* b, int bs, int kind, Px out[16]) {          // kind 1 = BC1 (8 bytes), 2 = BC2, 3 = BC3 (16 bytes)
+    const uint8_t* c = b + (bs == 16 ? 8 : 0); uint16_t c0 = (uint16_t)(c[0] | c[1] << 8), c1 = (uint16_t)(c[2] | c[3] << 8); Px pal[4]; int i;
+    uint32_t idx = (uint32_t)c[4] | (uint32_t)c[5] << 8 | (uint32_t)c[6] << 16 | (uint32_t)c[7] << 24;
+    ColorPalette(c0, c1, bs == 16 || c0 > c1, pal);
+    for (i = 0; i < 16; i++) out[i] = pal[(idx >> (2 * i)) & 3];
+    if (kind == 2) for (i = 0; i < 16; i++) out[i].a = (uint8_t)(((b[i / 2] >> (4 * (i & 1))) & 15) * 17);   // BC2
+    else if (kind == 3) {                                                                                              // BC3
+        uint8_t a[8]; uint64_t ai = 0; int k;
+        a[0] = b[0]; a[1] = b[1];
+        if (a[0] > a[1]) for (k = 1; k < 7; k++) a[k + 1] = (uint8_t)(((7 - k) * a[0] + k * a[1] + 3) / 7);
+        else { for (k = 1; k < 5; k++) a[k + 1] = (uint8_t)(((5 - k) * a[0] + k * a[1] + 2) / 5); a[6] = 0; a[7] = 255; }
+        for (k = 0; k < 6; k++) ai |= (uint64_t)b[2 + k] << (8 * k);
+        for (i = 0; i < 16; i++) out[i].a = a[(ai >> (3 * i)) & 7];
+    }
+}
+static void EncodeColor(const Px p[16], uint8_t* o, int allowTransparent) {       // BC1 colour block (BC2/BC3: allowTransparent 0)
+    float mean[3] = {0}, ax[3] = {1, 1, 1}, lo = 1e30f, hi = -1e30f; int i, k, n = 0, transp = 0, it; uint16_t c0, c1; Px pal[4]; uint32_t idx = 0;
+    for (i = 0; i < 16; i++) { if (allowTransparent && p[i].a < 128) { transp = 1; continue; } for (k = 0; k < 3; k++) mean[k] += (&p[i].r)[k]; n++; }
+    if (!n) { o[0] = o[1] = o[2] = o[3] = 0; o[4] = o[5] = o[6] = o[7] = 0xff; return; }   // all transparent
+    for (k = 0; k < 3; k++) mean[k] /= n;
+    for (it = 0; it < 4; it++) {                                                  // principal axis (power iteration on the covariance)
+        float nx[3] = {0}, l;
+        for (i = 0; i < 16; i++) { float d[3], dot; if (allowTransparent && p[i].a < 128) continue;
+            for (k = 0; k < 3; k++) d[k] = (&p[i].r)[k] - mean[k];
+            dot = d[0] * ax[0] + d[1] * ax[1] + d[2] * ax[2]; for (k = 0; k < 3; k++) nx[k] += dot * d[k]; }
+        l = sqrtf(nx[0] * nx[0] + nx[1] * nx[1] + nx[2] * nx[2]); if (l < 1e-6f) break;
+        for (k = 0; k < 3; k++) ax[k] = nx[k] / l;
+    }
+    for (i = 0; i < 16; i++) { float t; if (allowTransparent && p[i].a < 128) continue;
+        t = ((&p[i].r)[0] - mean[0]) * ax[0] + ((&p[i].r)[1] - mean[1]) * ax[1] + ((&p[i].r)[2] - mean[2]) * ax[2];
+        if (t < lo) lo = t; if (t > hi) hi = t; }
+    c0 = To565(mean[0] + ax[0] * hi, mean[1] + ax[1] * hi, mean[2] + ax[2] * hi); c1 = To565(mean[0] + ax[0] * lo, mean[1] + ax[1] * lo, mean[2] + ax[2] * lo);
+    if (transp) { if (c0 > c1) { uint16_t t = c0; c0 = c1; c1 = t; } }          // 3 colours + transparent: c0 <= c1
+    else if (c0 < c1) { uint16_t t = c0; c0 = c1; c1 = t; }                       // 4 colours: c0 > c1 (equal: index 0 everywhere)
+    ColorPalette(c0, c1, !transp && c0 > c1, pal);
+    for (i = 0; i < 16; i++) {
+        int best = 0, bd = 1 << 30, nk = transp ? 3 : 4;
+        if (transp && p[i].a < 128) best = 3;
+        else for (k = 0; k < nk; k++) { int dr = p[i].r - pal[k].r, dg = p[i].g - pal[k].g, db = p[i].b - pal[k].b, d = dr * dr + dg * dg + db * db; if (d < bd) { bd = d; best = k; } }
+        if (!transp && c0 == c1) best = 0;
+        idx |= (uint32_t)best << (2 * i);
+    }
+    o[0] = (uint8_t)c0; o[1] = (uint8_t)(c0 >> 8); o[2] = (uint8_t)c1; o[3] = (uint8_t)(c1 >> 8);
+    o[4] = (uint8_t)idx; o[5] = (uint8_t)(idx >> 8); o[6] = (uint8_t)(idx >> 16); o[7] = (uint8_t)(idx >> 24);
+}
+static void EncodeAlphaBC3(const Px p[16], uint8_t* o) {
+    uint8_t lo = 255, hi = 0, a[8]; uint64_t ai = 0; int i, k;
+    for (i = 0; i < 16; i++) { if (p[i].a < lo) lo = p[i].a; if (p[i].a > hi) hi = p[i].a; }
+    o[0] = hi; o[1] = lo;
+    if (hi == lo) { memset(o + 2, 0, 6); return; }
+    a[0] = hi; a[1] = lo; for (k = 1; k < 7; k++) a[k + 1] = (uint8_t)(((7 - k) * hi + k * lo + 3) / 7);
+    for (i = 0; i < 16; i++) { int best = 0, bd = 1 << 30; for (k = 0; k < 8; k++) { int d = abs(p[i].a - a[k]); if (d < bd) { bd = d; best = k; } } ai |= (uint64_t)best << (3 * i); }
+    for (k = 0; k < 6; k++) o[2 + k] = (uint8_t)(ai >> (8 * k));
+}
+static int GenMips(Buf* f, int* outMips) {
+    uint32_t hgt, wid, mips, pf, fourcc, bits, W, H, full = 1, m, v; int bs = 0, kind = 0; size_t total = 0, off = 128, l0; uint8_t* d; Px* img; Px* nxt;
+    memcpy(&hgt, f->p + 12, 4); memcpy(&wid, f->p + 16, 4); memcpy(&mips, f->p + 28, 4); memcpy(&pf, f->p + 80, 4); memcpy(&fourcc, f->p + 84, 4); memcpy(&bits, f->p + 88, 4);
+    if (mips > 1 || !wid || !hgt) return 0;
+    if (pf & 4) { if (fourcc == 0x31545844) { bs = 8; kind = 1; } else if (fourcc == 0x33545844) { bs = 16; kind = 2; } else if (fourcc == 0x35545844) { bs = 16; kind = 3; } else return 0; }
+    else if (bits != 32) return 0;
+    W = bs ? (wid + 3) & ~3u : wid; H = bs ? (hgt + 3) & ~3u : hgt;
+    while ((W >> (full - 1)) > 1 || (H >> (full - 1)) > 1) full++;
+    if (full < 2) return 0;
+    l0 = bs ? (size_t)(W / 4) * (H / 4) * bs : (size_t)W * H * 4;
+    if (128 + l0 > f->n) return 0;
+    for (m = 0; m < full; m++) { uint32_t mw = W >> m, mh = H >> m; if (!mw) mw = 1; if (!mh) mh = 1; total += bs ? (size_t)((mw + 3) / 4) * ((mh + 3) / 4) * bs : (size_t)mw * mh * 4; }
+    d = malloc(128 + total); img = malloc((size_t)W * H * sizeof(Px)); nxt = malloc((size_t)((W + 1) / 2) * ((H + 1) / 2) * sizeof(Px) + sizeof(Px));
+    if (!d || !img || !nxt) { free(d); free(img); free(nxt); return 0; }
+    memcpy(d, f->p, 128); memcpy(d + 128, f->p + 128, l0);                  // header, level 0 as it is
+    memcpy(d + 12, &H, 4); memcpy(d + 16, &W, 4); memcpy(d + 28, &full, 4);
+    v = bs ? (uint32_t)l0 : W * 4; memcpy(d + 20, &v, 4);
+    memcpy(&v, d + 8, 4); v |= 0x20000; memcpy(d + 8, &v, 4);                // DDSD_MIPMAPCOUNT
+    memcpy(&v, d + 108, 4); v |= 0x401008; memcpy(d + 108, &v, 4);           // complex, texture, mipmap
+    if (bs) {                                                                 // decode level 0
+        uint32_t bx, by, i;
+        for (by = 0; by < H / 4; by++) for (bx = 0; bx < W / 4; bx++) {
+            Px blk[16]; DecodeBlock(f->p + 128 + ((size_t)by * (W / 4) + bx) * bs, bs, kind, blk);
+            if (kind == 1) for (i = 0; i < 16; i++) if (blk[i].a == 0) blk[i].r = blk[i].g = blk[i].b = 0;
+            for (i = 0; i < 16; i++) img[((size_t)by * 4 + i / 4) * W + bx * 4 + i % 4] = blk[i];
+        }
+    } else { size_t i; const uint8_t* s = f->p + 128; for (i = 0; i < (size_t)W * H; i++) { img[i].b = s[i * 4]; img[i].g = s[i * 4 + 1]; img[i].r = s[i * 4 + 2]; img[i].a = s[i * 4 + 3]; } }
+    off = 128 + l0;
+    for (m = 1; m < full; m++) {
+        uint32_t pw = W >> (m - 1), ph = H >> (m - 1), mw = W >> m, mh = H >> m, x, y; Px* t;
+        if (!pw) pw = 1; if (!ph) ph = 1; if (!mw) mw = 1; if (!mh) mh = 1;
+        for (y = 0; y < mh; y++) for (x = 0; x < mw; x++) {                   // 2x2 box, colour weighted by alpha
+            uint32_t xs[2] = { x * 2 < pw ? x * 2 : pw - 1, x * 2 + 1 < pw ? x * 2 + 1 : pw - 1 }, ys[2] = { y * 2 < ph ? y * 2 : ph - 1, y * 2 + 1 < ph ? y * 2 + 1 : ph - 1 };
+            uint32_t sa = 0, sr = 0, sg = 0, sb = 0, ur = 0, ug = 0, ub = 0; int q; Px o;
+            for (q = 0; q < 4; q++) { const Px* s = &img[(size_t)ys[q / 2] * pw + xs[q % 2]]; sa += s->a; sr += s->r * s->a; sg += s->g * s->a; sb += s->b * s->a; ur += s->r; ug += s->g; ub += s->b; }
+            if (sa) { o.r = (uint8_t)((sr + sa / 2) / sa); o.g = (uint8_t)((sg + sa / 2) / sa); o.b = (uint8_t)((sb + sa / 2) / sa); }
+            else { o.r = (uint8_t)((ur + 2) / 4); o.g = (uint8_t)((ug + 2) / 4); o.b = (uint8_t)((ub + 2) / 4); }
+            o.a = (uint8_t)((sa + 2) / 4);
+            nxt[(size_t)y * mw + x] = o;
+        }
+        t = img; img = nxt; nxt = t;                                          // (nxt is big enough for every following level)
+        if (bs) {
+            uint32_t bx, by, nbx = (mw + 3) / 4, nby = (mh + 3) / 4; int i;
+            for (by = 0; by < nby; by++) for (bx = 0; bx < nbx; bx++) {
+                Px blk[16]; uint8_t* o = d + off + ((size_t)by * nbx + bx) * bs;
+                for (i = 0; i < 16; i++) { uint32_t px = bx * 4 + i % 4, py = by * 4 + i / 4; if (px >= mw) px = mw - 1; if (py >= mh) py = mh - 1; blk[i] = img[(size_t)py * mw + px]; }
+                if (kind == 1) EncodeColor(blk, o, 1);
+                else if (kind == 2) { int k; for (k = 0; k < 8; k++) o[k] = (uint8_t)(((blk[2 * k].a * 15 + 127) / 255) | ((blk[2 * k + 1].a * 15 + 127) / 255) << 4); EncodeColor(blk, o + 8, 0); }
+                else { EncodeAlphaBC3(blk, o); EncodeColor(blk, o + 8, 0); }
+            }
+            off += (size_t)nbx * nby * bs;
+        } else { size_t i; uint8_t* o = d + off; for (i = 0; i < (size_t)mw * mh; i++) { o[i * 4] = img[i].b; o[i * 4 + 1] = img[i].g; o[i * 4 + 2] = img[i].r; o[i * 4 + 3] = img[i].a; } off += (size_t)mw * mh * 4; }
+    }
+    free(img); free(nxt);
+    free(f->p); f->p = d; f->n = 128 + total; *outMips = (int)full;
+    return 1;
+}
+
 // DDS with the first <drop> mip levels removed (DXT1/3/5 or 32-bit uncompressed, no DX10 header).
 static size_t MakeTexture(uint8_t* dst, size_t cap, int id, int drop, char* msg) {
     Buf* f; uint32_t hgt, wid, mips, pfFlags, fourcc, bits; size_t off = 128, sz; int bs = 0, i;
@@ -516,7 +647,11 @@ static size_t MakeTexture(uint8_t* dst, size_t cap, int id, int drop, char* msg)
         char p[MAX_PATH * 2]; _snprintf(p, sizeof p, "%s\\Autogen\\%s", g_dir, g_tex[id]);
         *f = ReadFileAll(p);
         if (!f->p) { sprintf(msg, "cannot read %s", p); return 0; }
-        if (f->n >= 8 && !memcmp(f->p, "\x89PNG", 4) && PngToDds(f)) Log("TEXTURE %d: %s is a PNG, converted to a 32-bit DDS", id, g_tex[id]);
+        if (f->n >= 8 && !memcmp(f->p, "\x89PNG", 4)) { if (PngToDds(f)) Log("TEXTURE %d: %s is a PNG, converted to a 32-bit DDS", id, g_tex[id]); }
+        else if (f->n >= 128 && !memcmp(f->p, "DDS ", 4)) {
+            int nm = 0; DWORD t0 = GetTickCount();
+            if (GenMips(f, &nm)) Log("TEXTURE %d: %s had no mip levels: %d generated (%lu ms)", id, g_tex[id], nm, GetTickCount() - t0);
+        }
     }
     if (f->n < 128 || memcmp(f->p, "DDS ", 4)) { sprintf(msg, "not a DDS: %s", g_tex[id]); return 0; }
     memcpy(&hgt, f->p + 12, 4); memcpy(&wid, f->p + 16, 4); memcpy(&mips, f->p + 28, 4);
