@@ -13,6 +13,10 @@
 #include <math.h>
 #include <stdarg.h>
 #include "c3h_proto.h"
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+#define STBI_NO_STDIO
+#include "third_party/stb_image.h"                                // public domain (github.com/nothings/stb)
 
 static FILE* g_log;
 static void Log(const char* fmt, ...) {
@@ -92,10 +96,24 @@ static uint8_t  (*g_texDrop)[LODS];                               // mip levels 
                                                                   // a detail set's own atlas pages are already coarse -> 0
 static CRITICAL_SECTION g_texLock;                                // TexId is called from the OPEN worker threads
 
+// Big landscapes (the native ones: Slovenia3 has 2802 autogen tiles) cannot be cut up at OPEN: that took minutes and GBs, and the
+// game showed no autogen meanwhile. Above LAZY_TILES tiles OPEN only lists the tiles: every tile gets a fixed g_cpt x g_cpt grid
+// of chunk slots (no adaptive splits), and a tile is read and cut the first time one of its chunks is asked for (the mod asks for
+// the nearest first). Slots without triangles answer "empty". Tiles not used for a while are dropped above LAZY_BUDGET.
+#define LAZY_TILES   64
+#define LAZY_MAX_TEX 4096                                         // texture ids are assigned as tiles are read: upper bound for the mod
+#define LAZY_BUDGET  (1536ull << 20)
+static int        g_lazy;
+static uint8_t*   g_tileState;                                    // 0 = not read, 2 = chunks ready
+static DWORD*     g_tileUse;
+static uint64_t*  g_tileBytes; static uint64_t g_lazyBytes; static unsigned g_tilesRead, g_tilesDropped;
+
 static int TexId(const char* t, int lod, int drop) {
     uint32_t i; int r = -1;
     if (!t[0]) return -1;
     EnterCriticalSection(&g_texLock);
+    if (g_lazy && g_ntex >= LAZY_MAX_TEX) { for (i = 0; i < g_ntex; i++) if (!_stricmp(g_tex[i], t)) { r = (int)i; break; }
+                                            if (r < 0) { LeaveCriticalSection(&g_texLock); return -1; } }
     for (i = 0; i < g_ntex; i++) if (!_stricmp(g_tex[i], t)) { r = (int)i; break; }
     if (r < 0) {
         g_tex = realloc(g_tex, (g_ntex + 1) * sizeof *g_tex); strcpy(g_tex[g_ntex], t);
@@ -206,10 +224,10 @@ static void EmitChunk(TileJob* e, TriList* per, float x0, float y0, float size, 
     if (!ntris) return;
     memset(&inf, 0, sizeof inf); memset(&cd, 0, sizeof cd);
     inf.min[0] = inf.min[1] = inf.min[2] = 1e30f; inf.max[0] = inf.max[1] = inf.max[2] = -1e30f;
-    split = depth < SPLIT_DEPTH && ntris * 44 > SPLIT_BYTES;                    // estimate: 12 B indices + ~1 vertex (32 B) per triangle
+    split = !g_lazy && depth < SPLIT_DEPTH && ntris * 44 > SPLIT_BYTES;                    // estimate: 12 B indices + ~1 vertex (32 B) per triangle
     if (!split) {
         inf.tris[0] = BuildChunk(&cd.blob[0], m, e->tx, e->ty, 0, per, 0, 0, inf.min, inf.max);
-        split = depth < SPLIT_DEPTH && cd.blob[0].n > SPLIT_BYTES && ntris > 1;
+        split = !g_lazy && depth < SPLIT_DEPTH && cd.blob[0].n > SPLIT_BYTES && ntris > 1;
         if (split) { free(cd.blob[0].p); cd.blob[0].p = NULL; cd.blob[0].n = 0; }
     }
     if (split) {
@@ -350,7 +368,8 @@ static int OpenLandscape(const char* dir, char* msg) {
     // a new OPEN replaces everything
     { uint32_t i, l; for (i = 0; i < g_nchunks; i++) for (l = 0; l < LODS; l++) free(g_chunks[i].blob[l].p);
       for (i = 0; i < g_ntex; i++) free(g_texfile[i].p);
-      free(g_chunks); free(g_info); free(g_tex); free(g_texfile); free(g_texDrop); g_chunks = NULL; g_info = NULL; g_tex = NULL; g_texfile = NULL; g_texDrop = NULL; g_nchunks = g_ntex = 0; }
+      free(g_chunks); free(g_info); free(g_tex); free(g_texfile); free(g_texDrop); g_chunks = NULL; g_info = NULL; g_tex = NULL; g_texfile = NULL; g_texDrop = NULL; g_nchunks = g_ntex = 0;
+      free(g_tileState); free(g_tileUse); free(g_tileBytes); g_tileState = NULL; g_tileUse = NULL; g_tileBytes = NULL; g_lazy = 0; g_lazyBytes = 0; g_tilesRead = g_tilesDropped = 0; }
     { const char* nm = strrchr(dir, '\\'); nm = nm ? nm + 1 : dir;
       _snprintf(p, sizeof p, "%s\\%s.trn", dir, nm); trn = ReadFileAll(p);
       if (trn.n < 12) { sprintf(msg, "cannot read %s", p); return -1; }
@@ -392,6 +411,25 @@ static int OpenLandscape(const char* dir, char* msg) {
         }
         free(lods.p);
     }
+    if (g_njobs > LAZY_TILES) {   // big landscape: slots only, tiles are read on demand (ReadTile)
+        uint32_t per = g_cpt * g_cpt, s2; float cs = g_tile / g_cpt;
+        g_lazy = 1; g_nchunks = (uint32_t)g_njobs * per;
+        g_info = calloc(g_nchunks + 1, sizeof *g_info); g_chunks = calloc(g_nchunks + 1, sizeof *g_chunks);
+        g_tileState = calloc((size_t)g_njobs + 1, 1); g_tileUse = calloc((size_t)g_njobs + 1, sizeof *g_tileUse); g_tileBytes = calloc((size_t)g_njobs + 1, sizeof *g_tileBytes);
+        for (k = 0; k < g_njobs; k++) for (s2 = 0; s2 < per; s2++) {
+            const TileJob* J = &g_jobs[k]; C3hChunkInfo* in = &g_info[(size_t)k * per + s2]; int ci = (int)(s2 / g_cpt), cj = (int)(s2 % g_cpt), l; float cell = 0;
+            in->tile_x = (int16_t)J->tx; in->tile_y = (int16_t)J->ty; in->cx = (uint16_t)(ci << SPLIT_DEPTH); in->cy = (uint16_t)(cj << SPLIT_DEPTH);
+            in->min[0] = -g_tile * 0.5f + ci * cs; in->min[1] = -g_tile * 0.5f + cj * cs; in->min[2] = -1000.0f;   // height unknown until read
+            in->max[0] = in->min[0] + cs; in->max[1] = in->min[1] + cs; in->max[2] = 9000.0f;
+            for (l = 0; l < LODS; l++) {                         // the LOD chain ProcessTile will build (sets, then clustering)
+                in->bytes[l] = 1;                                // not known yet: "probably there", the answer may be "empty"
+                if (l < J->nsrc) { in->level[l] = (int8_t)J->level[l]; in->err[l] = LevelError(J->level[l]); }
+                else { cell = cell > 0 ? cell * 3.0f : (4.0f * in->err[l - 1] > 8.0f ? 4.0f * in->err[l - 1] : 8.0f); in->level[l] = -1; in->err[l] = cell * 0.5f; }
+            }
+        }
+        sprintf(msg, "%d tiles: read on demand (%u chunk slots, %d detail sets); %lu ms", g_njobs, g_nchunks, hasSets, (unsigned long)(GetTickCount() - t0));
+        return 0;
+    }
     {   SYSTEM_INFO si; HANDLE th[8]; GetSystemInfo(&si);
         nthr = (int)si.dwNumberOfProcessors; if (nthr > 4) nthr = 4; if (nthr > g_njobs) nthr = g_njobs; if (nthr < 1) nthr = 1;
         g_nextJob = 0;
@@ -413,6 +451,62 @@ static int OpenLandscape(const char* dir, char* msg) {
     return 0;
 }
 
+// Lazy mode: makes sure the tile of chunk slot c is read and cut; drops tiles nobody used for a while above LAZY_BUDGET.
+static void ReadTile(uint32_t c) {
+    uint32_t per = g_cpt * g_cpt, j = c / per, base = j * per, i, l; TileJob* J = &g_jobs[j]; uint64_t sum = 0; DWORD now = GetTickCount();
+    g_tileUse[j] = now;
+    if (g_tileState[j] == 2) return;
+    J->leaf = NULL; J->nleaf = J->cap = J->split = 0; memset(J->tris, 0, sizeof J->tris); memset(J->bytes, 0, sizeof J->bytes);
+    ProcessTile(J);
+    for (i = 0; i < per; i++) { C3hChunkInfo* in = &g_info[base + i]; memset(in->bytes, 0, sizeof in->bytes); memset(in->tris, 0, sizeof in->tris); }
+    for (i = 0; i < J->nleaf; i++) {
+        const Leaf* L = &J->leaf[i]; uint32_t s2 = (uint32_t)(L->gx >> SPLIT_DEPTH) * g_cpt + (uint32_t)(L->gy >> SPLIT_DEPTH);
+        if (s2 >= per) { for (l = 0; l < LODS; l++) free(L->cd.blob[l].p); continue; }
+        g_info[base + s2] = L->inf; g_chunks[base + s2] = L->cd;
+        for (l = 0; l < LODS; l++) sum += L->cd.blob[l].n;
+    }
+    free(J->leaf); J->leaf = NULL; J->nleaf = J->cap = 0;
+    g_tileState[j] = 2; g_tileBytes[j] = sum; g_lazyBytes += sum; g_tilesRead++;
+    while (g_lazyBytes > LAZY_BUDGET) {                          // least recently used tile, not touched for 20 s
+        int64_t best = -1; DWORD oldest = 0; int k;
+        for (k = 0; k < g_njobs; k++) if (g_tileState[k] == 2 && (uint32_t)k != j && now - g_tileUse[k] > 20000 && (best < 0 || now - g_tileUse[k] > oldest)) { best = k; oldest = now - g_tileUse[k]; }
+        if (best < 0) break;
+        for (i = (uint32_t)best * per; i < ((uint32_t)best + 1) * per; i++) for (l = 0; l < LODS; l++) { free(g_chunks[i].blob[l].p); g_chunks[i].blob[l].p = NULL; g_chunks[i].blob[l].n = 0; }
+        g_lazyBytes -= g_tileBytes[best]; g_tileBytes[best] = 0; g_tileState[best] = 0; g_tilesDropped++;
+    }
+}
+
+// Some native autogen textures are PNG files named .dds (the game's loader takes both). They become an uncompressed 32-bit DDS
+// (B8G8R8A8, full mip chain, box filtered) once, in place of the file's bytes.
+static int PngToDds(Buf* f) {
+    int w, h, comp, mips = 1, m; uint8_t* rgba = stbi_load_from_memory(f->p, (int)f->n, &w, &h, &comp, 4); size_t total = 0, off = 128; uint8_t* d; uint32_t v;
+    if (!rgba) return 0;
+    while ((w >> (mips - 1)) > 1 || (h >> (mips - 1)) > 1) mips++;
+    for (m = 0; m < mips; m++) { int mw = w >> m, mh = h >> m; if (!mw) mw = 1; if (!mh) mh = 1; total += (size_t)mw * mh * 4; }
+    d = calloc(128 + total, 1);
+    if (!d) { stbi_image_free(rgba); return 0; }
+    memcpy(d, "DDS ", 4);
+    v = 124; memcpy(d + 4, &v, 4); v = 0x2100F; memcpy(d + 8, &v, 4); memcpy(d + 12, &h, 4); memcpy(d + 16, &w, 4);
+    v = (uint32_t)w * 4; memcpy(d + 20, &v, 4); memcpy(d + 28, &mips, 4);
+    v = 32; memcpy(d + 76, &v, 4); v = 0x41; memcpy(d + 80, &v, 4); v = 32; memcpy(d + 88, &v, 4);
+    v = 0x00ff0000; memcpy(d + 92, &v, 4); v = 0x0000ff00; memcpy(d + 96, &v, 4); v = 0x000000ff; memcpy(d + 100, &v, 4); v = 0xff000000; memcpy(d + 104, &v, 4);
+    v = 0x401008; memcpy(d + 108, &v, 4);
+    {   size_t i, n = (size_t)w * h; uint8_t* o = d + off;                // level 0: RGBA -> BGRA
+        for (i = 0; i < n; i++) { o[i * 4] = rgba[i * 4 + 2]; o[i * 4 + 1] = rgba[i * 4 + 1]; o[i * 4 + 2] = rgba[i * 4]; o[i * 4 + 3] = rgba[i * 4 + 3]; } }
+    for (m = 1; m < mips; m++) {                                          // each level: 2x2 box filter of the previous one
+        int pw = w >> (m - 1), ph = h >> (m - 1), mw = w >> m, mh = h >> m, x, y, c; const uint8_t* src; uint8_t* dst;
+        if (!pw) pw = 1; if (!ph) ph = 1; if (!mw) mw = 1; if (!mh) mh = 1;
+        src = d + off; off += (size_t)pw * ph * 4; dst = d + off;
+        for (y = 0; y < mh; y++) for (x = 0; x < mw; x++) for (c = 0; c < 4; c++) {
+            int x0 = x * 2 < pw ? x * 2 : pw - 1, x1 = x * 2 + 1 < pw ? x * 2 + 1 : pw - 1, y0 = y * 2 < ph ? y * 2 : ph - 1, y1 = y * 2 + 1 < ph ? y * 2 + 1 : ph - 1;
+            dst[((size_t)y * mw + x) * 4 + c] = (uint8_t)((src[((size_t)y0 * pw + x0) * 4 + c] + src[((size_t)y0 * pw + x1) * 4 + c] + src[((size_t)y1 * pw + x0) * 4 + c] + src[((size_t)y1 * pw + x1) * 4 + c] + 2) / 4);
+        }
+    }
+    stbi_image_free(rgba);
+    free(f->p); f->p = d; f->n = 128 + total;
+    return 1;
+}
+
 // DDS with the first <drop> mip levels removed (DXT1/3/5 or 32-bit uncompressed, no DX10 header).
 static size_t MakeTexture(uint8_t* dst, size_t cap, int id, int drop, char* msg) {
     Buf* f; uint32_t hgt, wid, mips, pfFlags, fourcc, bits; size_t off = 128, sz; int bs = 0, i;
@@ -422,6 +516,7 @@ static size_t MakeTexture(uint8_t* dst, size_t cap, int id, int drop, char* msg)
         char p[MAX_PATH * 2]; _snprintf(p, sizeof p, "%s\\Autogen\\%s", g_dir, g_tex[id]);
         *f = ReadFileAll(p);
         if (!f->p) { sprintf(msg, "cannot read %s", p); return 0; }
+        if (f->n >= 8 && !memcmp(f->p, "\x89PNG", 4) && PngToDds(f)) Log("TEXTURE %d: %s is a PNG, converted to a 32-bit DDS", id, g_tex[id]);
     }
     if (f->n < 128 || memcmp(f->p, "DDS ", 4)) { sprintf(msg, "not a DDS: %s", g_tex[id]); return 0; }
     memcpy(&hgt, f->p + 12, 4); memcpy(&wid, f->p + 16, 4); memcpy(&mips, f->p + 28, 4);
@@ -481,7 +576,7 @@ int main(int argc, char** argv) {
             if (hd->status == 0) {
                 C3hLandscape L; size_t need = sizeof L + (size_t)g_nchunks * sizeof(C3hChunkInfo);
                 memset(&L, 0, sizeof L);
-                L.tiles_x = g_tx; L.tiles_y = g_ty; L.tile_size = g_tile; L.chunks_per_tile = g_cpt; L.n_chunks = g_nchunks; L.n_textures = g_ntex;
+                L.tiles_x = g_tx; L.tiles_y = g_ty; L.tile_size = g_tile; L.chunks_per_tile = g_cpt; L.n_chunks = g_nchunks; L.n_textures = g_lazy ? LAZY_MAX_TEX : g_ntex;
                 L.n_lods = LODS; L.lod_cell[0] = 0; L.lod_cell[1] = 8; L.lod_cell[2] = 24; L.lod_cell[3] = 72;   // typical (per tile it varies)
                 if (need > hd->arena_size) { hd->status = -1; sprintf(hd->resp_msg, "chunk table too large"); }
                 else { memcpy(arena, &L, sizeof L); memcpy(arena + sizeof L, g_info, (size_t)g_nchunks * sizeof(C3hChunkInfo)); hd->resp_size = (uint32_t)need; }
@@ -491,6 +586,7 @@ int main(int argc, char** argv) {
         case C3H_REQ_CHUNK: {
             int c = hd->req_arg[0], l = hd->req_arg[1];
             if (c < 0 || (uint32_t)c >= g_nchunks || l < 0 || l >= LODS) { hd->status = -1; sprintf(hd->resp_msg, "bad chunk %d lod %d", c, l); break; }
+            if (g_lazy) ReadTile((uint32_t)c);
             if (!g_chunks[c].blob[l].n) { hd->status = 1; break; }
             memcpy(arena, g_chunks[c].blob[l].p, g_chunks[c].blob[l].n); hd->resp_size = (uint32_t)g_chunks[c].blob[l].n;
             break; }
@@ -503,7 +599,7 @@ int main(int argc, char** argv) {
             hd->resp_size = (uint32_t)n;
             break; }
         case C3H_REQ_STATS: {
-            sprintf(hd->resp_msg, "chunks %u textures %u", g_nchunks, g_ntex);
+            sprintf(hd->resp_msg, "chunks %u textures %u; lazy %d: tiles read %u dropped %u, %llu MB held", g_nchunks, g_ntex, g_lazy, g_tilesRead, g_tilesDropped, (unsigned long long)(g_lazyBytes >> 20));
             break; }
         case C3H_REQ_QUIT:
             Log("QUIT");

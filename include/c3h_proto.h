@@ -12,7 +12,7 @@
 #include <stdint.h>
 
 #define C3H_MAGIC        0x48334343u     /* 'CC3H' */
-#define C3H_VERSION      3u
+#define C3H_VERSION      4u
 #define C3H_HEADER_SIZE  4096u
 #define C3H_ARENA_SIZE   (48u << 20)     /* answer buffer; also limits the size of one chunk / texture */
 
@@ -33,7 +33,7 @@ typedef struct C3hHeader {
     uint32_t req_type;
     int32_t  req_arg[4];
     char     req_path[512];             // OPEN: landscape folder as a Windows path (e.g. C:\Condor3\Landscapes\OrlyDemo)
-    int32_t  status;                    // 0 = ok, 1 = ok but empty, < 0 = error (resp_msg says why)
+    int32_t  status;                    // 0 = ok, 1 = ok but empty (CHUNK: this chunk has nothing, never ask again), < 0 = error
     uint32_t resp_size;                 // valid bytes in the arena
     char     resp_msg[512];
 } C3hHeader;
@@ -45,7 +45,7 @@ typedef struct C3hLandscape {
     float    tile_size;                 // metres (64 * cell size)
     uint32_t chunks_per_tile;           // chunks along one tile side
     uint32_t n_chunks;                  // C3hChunkInfo entries that follow
-    uint32_t n_textures;
+    uint32_t n_textures;                // big landscapes (lazy tiles): an upper bound, ids are assigned as tiles are read
     uint32_t n_lods;                    // LOD levels available for every chunk (0 = full detail)
     float    lod_cell[C3H_MAX_LOD];     // typical vertex clustering cell per LOD (0 = a detail set); per chunk: C3hChunkInfo.err
 } C3hLandscape;
